@@ -1,4 +1,4 @@
-"""Script, image, TTS, subtitle, and FFmpeg video generation for Dark Mind Reels."""
+"""Script, image, expressive Gemini TTS, subtitle, and FFmpeg video generation for Dark Mind Reels."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -16,7 +17,8 @@ from typing import Any
 import edge_tts
 import requests
 import yaml
-from PIL import Image, ImageDraw
+from google import genai
+from google.genai import types
 
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = ROOT / "config.yaml"
@@ -45,6 +47,25 @@ def save_history(history: dict[str, Any]) -> None:
         json.dump(history, f, ensure_ascii=False, indent=2)
 
 
+def _discover_models(api_key: str, keyword: str) -> list[str]:
+    """Discover available Gemini models matching a keyword."""
+    try:
+        resp = requests.get(
+            f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}",
+            timeout=30,
+        )
+        if not resp.ok:
+            return []
+        return [
+            m["name"].removeprefix("models/")
+            for m in resp.json().get("models", [])
+            if "generateContent" in m.get("supportedGenerationMethods", [])
+            and keyword in m.get("name", "").lower()
+        ]
+    except Exception:
+        return []
+
+
 def generate_script_gemini(
     api_key: str,
     niche: str,
@@ -52,7 +73,7 @@ def generate_script_gemini(
     used_topics: list[str],
     custom_topic: str = "",
 ) -> dict[str, Any]:
-    """Ask Gemini 2.5 Flash for a dual-language (EN + TR) viral Reels script + visual prompts."""
+    """Ask Gemini for a dual-language (EN + TR) viral Reels script + visual prompts."""
     avoid = "\n".join(f"- {t}" for t in used_topics[-30:]) or "- (none)"
     topic_instruction = (
         f"Use this exact topic: {custom_topic}"
@@ -72,8 +93,8 @@ Rules:
 1. Scene 1 MUST be a shocking, curiosity-driven 1-sentence hook (first 2.5 seconds).
 2. Scenes 2-{scenes_count-1} deliver punchy, insightful psychological or Stoic explanation with real-life examples.
 3. Scene {scenes_count} delivers a memorable closing punchline / call-to-save.
-4. Provide BOTH natural English (`narration_en`) and natural, fluent Turkish (`narration_tr` — NOT stiff literal translation; use natural spoken Turkish).
-5. Each scene needs an `image_prompt` in English describing a dramatic, symbolic, moody scene with NO text in the image.
+4. Provide BOTH natural English (`narration_en`) and natural, fluent Turkish (`narration_tr` — spoken, dramatic, emotional Turkish; NOT stiff literal translation).
+5. Each scene needs an `image_prompt` in English describing a vivid, dramatic, symbolic scene with clear subject lighting and NO text in the image.
 
 Return ONLY valid JSON matching this schema:
 {{
@@ -92,6 +113,15 @@ Return ONLY valid JSON matching this schema:
   ]
 }}"""
 
+    candidates = [
+        m
+        for m in _discover_models(api_key, "flash")
+        if "tts" not in m.lower() and "image" not in m.lower()
+    ]
+    for fallback in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.5-flash-lite"]:
+        if fallback not in candidates:
+            candidates.append(fallback)
+
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
@@ -99,31 +129,6 @@ Return ONLY valid JSON matching this schema:
             "responseMimeType": "application/json",
         },
     }
-    candidates = [
-        "gemini-2.5-flash",
-        "gemini-2.0-flash",
-        "gemini-2.5-flash-lite",
-        "gemini-1.5-flash-latest",
-    ]
-    try:
-        models_resp = requests.get(
-            f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}",
-            timeout=30,
-        )
-        if models_resp.ok:
-            discovered = [
-                m["name"].removeprefix("models/")
-                for m in models_resp.json().get("models", [])
-                if "generateContent" in m.get("supportedGenerationMethods", [])
-                and "flash" in m.get("name", "").lower()
-                and "tts" not in m.get("name", "").lower()
-                and "image" not in m.get("name", "").lower()
-            ]
-            for d in discovered:
-                if d not in candidates:
-                    candidates.insert(0, d)
-    except Exception:
-        pass
 
     data = None
     last_err: Exception | None = None
@@ -135,16 +140,17 @@ Return ONLY valid JSON matching this schema:
         try:
             resp = requests.post(url, json=payload, timeout=90)
             if resp.status_code in (404, 429, 503):
-                print(f"[info] Model {model_name} returned {resp.status_code}, trying next...", file=sys.stderr)
+                print(f"[info] Text model {model_name} -> {resp.status_code}, trying next...", file=sys.stderr)
                 continue
             resp.raise_for_status()
             data = resp.json()
-            print(f"    Using Gemini model: {model_name}")
+            print(f"    Using Gemini text model: {model_name}")
             break
         except Exception as exc:
             last_err = exc
     if data is None:
-        raise RuntimeError(f"All Gemini models failed. Last error: {last_err}")
+        raise RuntimeError(f"All Gemini text models failed. Last error: {last_err}")
+
     raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
     raw_text = re.sub(r"^```json\s*|\s*```$", "", raw_text.strip(), flags=re.MULTILINE)
     script = json.loads(raw_text)
@@ -156,39 +162,73 @@ Return ONLY valid JSON matching this schema:
 def generate_scene_image(
     account_id: str,
     cf_token: str,
-    model: str,
+    cf_models: list[str],
+    gemini_client: genai.Client,
     prompt: str,
     style_prompt: str,
     out_path: Path,
 ) -> None:
-    """Generate a vertical 9:16 image via Cloudflare Workers AI (with fallback gradient)."""
-    url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{model}"
+    """Generate a vivid image via Cloudflare Workers AI (matching CF schemas) or Gemini Image."""
     headers = {"Authorization": f"Bearer {cf_token}"}
     full_prompt = f"{prompt}, {style_prompt}"
 
-    try:
-        resp = requests.post(
-            url,
-            headers=headers,
-            json={"prompt": full_prompt, "num_steps": 6, "width": 768, "height": 1344},
-            timeout=120,
-        )
-        resp.raise_for_status()
-        content_type = resp.headers.get("content-type", "")
-        if "application/json" in content_type:
-            b64 = resp.json()["result"]["image"]
-            out_path.write_bytes(base64.b64decode(b64))
-        else:
-            out_path.write_bytes(resp.content)
-        return
-    except Exception as exc:
-        print(f"[warn] Cloudflare image failed ({exc}), generating fallback frame.", file=sys.stderr)
-        img = Image.new("RGB", (768, 1344), (14, 14, 22))
-        draw = ImageDraw.Draw(img)
-        for y in range(1344):
-            shade = int(14 + (y / 1344) * 26)
-            draw.line([(0, y), (768, y)], fill=(shade, shade, shade + 12))
-        img.save(out_path, "PNG")
+    for model in cf_models:
+        url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{model}"
+        try:
+            if "flux-2" in model:
+                fields = {"prompt": (None, full_prompt), "width": (None, "768"), "height": (None, "1344")}
+                resp = requests.post(url, headers=headers, files=fields, timeout=120)
+                if resp.status_code == 400:
+                    resp = requests.post(url, headers=headers, files={"prompt": (None, full_prompt)}, timeout=120)
+            elif "flux" in model:
+                # flux-1-schnell accepts prompt + steps (rejects width/height/num_steps)
+                resp = requests.post(url, headers=headers, json={"prompt": full_prompt, "steps": 6}, timeout=120)
+                if resp.status_code == 400:
+                    resp = requests.post(url, headers=headers, json={"prompt": full_prompt}, timeout=120)
+            else:
+                resp = requests.post(
+                    url,
+                    headers=headers,
+                    json={"prompt": full_prompt, "width": 768, "height": 1344},
+                    timeout=120,
+                )
+
+            resp.raise_for_status()
+            content_type = resp.headers.get("content-type", "")
+            if "application/json" in content_type:
+                data = resp.json()
+                b64 = (data.get("result") or {}).get("image") or data.get("image")
+                if not b64:
+                    raise ValueError(f"No image field in response: {str(data)[:200]}")
+                out_path.write_bytes(base64.b64decode(b64))
+            else:
+                if len(resp.content) < 5000:
+                    raise ValueError(f"Image payload too small ({len(resp.content)} bytes)")
+                out_path.write_bytes(resp.content)
+            return
+        except Exception as exc:
+            print(f"[warn] Cloudflare {model} failed ({exc}), trying next...", file=sys.stderr)
+
+    # Fallback: Gemini native image generation
+    for gem_img_model in ["gemini-3.1-flash-lite-image", "gemini-2.5-flash-image", "gemini-2.0-flash-exp-image-generation"]:
+        try:
+            response = gemini_client.models.generate_content(
+                model=gem_img_model,
+                contents=full_prompt,
+                config=types.GenerateContentConfig(
+                    response_modalities=["IMAGE"],
+                    image_config=types.ImageConfig(aspect_ratio="9:16"),
+                ),
+            )
+            for part in response.parts or []:
+                if part.inline_data and part.inline_data.data:
+                    out_path.write_bytes(part.inline_data.data)
+                    print(f"    Generated with Gemini image ({gem_img_model})")
+                    return
+        except Exception as exc:
+            print(f"[warn] Gemini image {gem_img_model} failed ({exc})", file=sys.stderr)
+
+    raise RuntimeError("Both Cloudflare and Gemini image generation failed for scene.")
 
 
 def _fmt_ass_time(seconds: float) -> str:
@@ -213,7 +253,7 @@ WrapStyle: 2
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,DejaVu Sans,68,&H00FFFFFF,&H0000D7FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,5,2,2,80,80,420,1
+Style: Default,DejaVu Sans,70,&H0000E5FF,&H00FFFFFF,&H00000000,&H90000000,-1,0,0,0,100,100,0,0,1,6,2,2,80,80,400,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -229,10 +269,69 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     out_path.write_text("\n".join(lines), encoding="utf-8")
 
 
-async def _synthesize_scene_audio(
+def _synthesize_gemini_tts(
+    client: genai.Client,
+    tts_models: list[str],
+    text: str,
+    voice_name: str,
+    lang_code: str,
+    out_wav: Path,
+) -> bool:
+    """Synthesize expressive, emotional speech via Gemini Native TTS."""
+    style_dir = (
+        "Read the following in a deep, intense, suspenseful, emotionally gripping documentary voice "
+        "with natural dramatic pauses and emphasis. Output ONLY the spoken words:"
+        if lang_code == "en"
+        else "Aşağıdaki metni derin, etkileyici, gizemli ve duygulu bir belgesel anlatıcısı tonuyla, "
+        "doğal duraklamalar ve vurgularla Türkçe olarak seslendir. Sadece metni oku:"
+    )
+    prompt = f"{style_dir}\n\n{text}"
+
+    for model_name in tts_models:
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_modalities=["AUDIO"],
+                    speech_config=types.SpeechConfig(
+                        voice_config=types.VoiceConfig(
+                            prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice_name)
+                        )
+                    ),
+                ),
+            )
+            for part in response.parts or []:
+                if part.inline_data and part.inline_data.data:
+                    raw_bytes = part.inline_data.data
+                    raw_path = out_wav.with_suffix(".raw")
+                    raw_path.write_bytes(raw_bytes)
+                    if raw_bytes[:4] == b"RIFF":
+                        subprocess.run(
+                            ["ffmpeg", "-y", "-i", str(raw_path), "-ar", "44100", "-ac", "2", str(out_wav)],
+                            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        )
+                    else:
+                        # Gemini TTS raw PCM is 24kHz 16-bit mono little-endian
+                        subprocess.run(
+                            [
+                                "ffmpeg", "-y", "-f", "s16le", "-ar", "24000", "-ac", "1",
+                                "-i", str(raw_path), "-ar", "44100", "-ac", "2", str(out_wav),
+                            ],
+                            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        )
+                    raw_path.unlink(missing_ok=True)
+                    return True
+        except Exception as exc:
+            print(f"[warn] Gemini TTS {model_name} failed ({exc})", file=sys.stderr)
+            time.sleep(1.5)
+    return False
+
+
+async def _synthesize_edge_tts(
     text: str, voice: str, rate: str, mp3_path: Path
 ) -> list[tuple[float, float, str]]:
-    """Synthesize one scene via Edge-TTS and return word-level (start, end, word) timings."""
+    """Fallback synthesizer using Edge-TTS with word boundaries."""
     communicate = edge_tts.Communicate(text, voice=voice, rate=rate, boundary="WordBoundary")
     words: list[tuple[float, float, str]] = []
     with mp3_path.open("wb") as f:
@@ -249,47 +348,42 @@ async def _synthesize_scene_audio(
 def _probe_duration(media_path: Path) -> float:
     """Get exact media duration in seconds using ffprobe."""
     cmd = [
-        "ffprobe",
-        "-v",
-        "error",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
-        str(media_path),
+        "ffprobe", "-v", "error", "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1", str(media_path),
     ]
-    out = subprocess.check_output(cmd, text=True).strip()
-    return float(out)
+    return float(subprocess.check_output(cmd, text=True).strip())
 
 
 def _group_words_into_captions(
     words: list[tuple[float, float, str]],
     offset: float,
-    scene_dur: float,
+    speech_dur: float,
     fallback_text: str,
     max_words: int = 3,
 ) -> list[tuple[float, float, str]]:
-    """Group word boundaries into punchy 2-3 word Reels captions."""
+    """Group word boundaries or character-weighted text into punchy 2-3 word Reels captions."""
     if not words:
         parts = fallback_text.split()
         if not parts:
             return []
         groups = [" ".join(parts[i : i + max_words]) for i in range(0, len(parts), max_words)]
-        step = scene_dur / len(groups)
-        return [
-            (offset + i * step, offset + (i + 1) * step, g.upper())
-            for i, g in enumerate(groups)
-        ]
+        total_chars = sum(max(1, len(g)) for g in groups)
+        captions: list[tuple[float, float, str]] = []
+        cursor = offset
+        for g in groups:
+            g_dur = speech_dur * (max(1, len(g)) / total_chars)
+            captions.append((cursor, cursor + g_dur, g.upper()))
+            cursor += g_dur
+        return captions
 
-    captions: list[tuple[float, float, str]] = []
+    captions = []
     for i in range(0, len(words), max_words):
         batch = words[i : i + max_words]
         start = offset + batch[0][0]
         end = offset + batch[-1][1]
         if end <= start:
             end = start + 0.35
-        phrase = " ".join(w[2] for w in batch).upper()
-        captions.append((start, end, phrase))
+        captions.append((start, end, " ".join(w[2] for w in batch).upper()))
     return captions
 
 
@@ -297,51 +391,62 @@ def render_language_video(
     lang_cfg: dict[str, Any],
     scenes: list[dict[str, Any]],
     scene_images: list[Path],
+    gemini_client: genai.Client,
+    tts_models: list[str],
     work_dir: Path,
     final_mp4: Path,
     fps: int = 30,
 ) -> None:
-    """Synthesize per-scene voiceovers, build ambient bed, and render 1080x1920 MP4."""
+    """Synthesize expressive per-scene voiceovers, build ambient bed, and render 1080x1920 MP4."""
     code = lang_cfg["code"]
-    voice = lang_cfg["voice"]
-    rate = lang_cfg.get("rate", "+0%")
+    gemini_voice = lang_cfg.get("gemini_voice", "Charon")
+    edge_voice = lang_cfg["edge_voice"]
+    rate = lang_cfg.get("rate", "+4%")
     lang_dir = work_dir / code
     lang_dir.mkdir(parents=True, exist_ok=True)
 
-    scene_audios: list[Path] = []
+    padded_wavs: list[Path] = []
     scene_durations: list[float] = []
     all_captions: list[tuple[float, float, str]] = []
     elapsed = 0.0
 
     for idx, scene in enumerate(scenes):
         text = scene[f"narration_{code}"].strip()
-        mp3_path = lang_dir / f"scene_{idx:02d}.mp3"
-        words = asyncio.run(_synthesize_scene_audio(text, voice, rate, mp3_path))
-        dur = _probe_duration(mp3_path) + 0.18  # brief breathing pause between scenes
-        all_captions.extend(_group_words_into_captions(words, elapsed, dur, text))
-        scene_audios.append(mp3_path)
-        scene_durations.append(dur)
-        elapsed += dur
+        raw_wav = lang_dir / f"scene_{idx:02d}.wav"
+        words: list[tuple[float, float, str]] = []
+
+        used_gemini = _synthesize_gemini_tts(
+            gemini_client, tts_models, text, gemini_voice, code, raw_wav
+        )
+        if not used_gemini:
+            mp3_path = lang_dir / f"scene_{idx:02d}.mp3"
+            words = asyncio.run(_synthesize_edge_tts(text, edge_voice, rate, mp3_path))
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", str(mp3_path), "-ar", "44100", "-ac", "2", str(raw_wav)],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+
+        speech_dur = _probe_duration(raw_wav)
+        total_scene_dur = speech_dur + 0.22
+        all_captions.extend(_group_words_into_captions(words, elapsed, speech_dur, text))
+
+        pad_wav = lang_dir / f"scene_{idx:02d}_pad.wav"
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", str(raw_wav),
+                "-af", f"apad=whole_dur={total_scene_dur:.3f}",
+                "-ar", "44100", "-ac", "2", str(pad_wav),
+            ],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        padded_wavs.append(pad_wav)
+        scene_durations.append(total_scene_dur)
+        elapsed += total_scene_dur
 
     ass_path = lang_dir / f"subtitles_{code}.ass"
     _write_ass(all_captions, ass_path)
 
-    # Concatenate voiceovers with 0.18s silence pad per scene
     concat_list = lang_dir / "audio_concat.txt"
-    padded_wavs: list[Path] = []
-    for idx, (mp3, dur) in enumerate(zip(scene_audios, scene_durations)):
-        wav = lang_dir / f"scene_{idx:02d}_pad.wav"
-        subprocess.run(
-            [
-                "ffmpeg", "-y", "-i", str(mp3),
-                "-af", f"apad=whole_dur={dur:.3f}",
-                "-ar", "44100", "-ac", "2", str(wav),
-            ],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        padded_wavs.append(wav)
     concat_list.write_text(
         "\n".join(f"file '{w.as_posix()}'" for w in padded_wavs), encoding="utf-8"
     )
@@ -351,23 +456,20 @@ def render_language_video(
             "ffmpeg", "-y", "-f", "concat", "-safe", "0",
             "-i", str(concat_list), "-c", "copy", str(voice_wav),
         ],
-        check=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
 
-    # Render each scene image with smooth Ken Burns slow zoom + vignette
     scene_clips: list[Path] = []
     for idx, (img_path, dur) in enumerate(zip(scene_images, scene_durations)):
         frames = max(1, int(round(dur * fps)))
         clip_path = lang_dir / f"clip_{idx:02d}.mp4"
-        direction = "min(zoom+0.0009,1.12)" if idx % 2 == 0 else "if(eq(on,1),1.12,max(1.0,zoom-0.0009))"
+        direction = "min(zoom+0.0008,1.10)" if idx % 2 == 0 else "if(eq(on,1),1.10,max(1.0,zoom-0.0008))"
         vf = (
-            f"scale=1200:2133:force_original_aspect_ratio=increase,"
-            f"crop=1200:2133,"
+            f"scale=1080:1920:force_original_aspect_ratio=increase,"
+            f"crop=1080:1920,"
             f"zoompan=z='{direction}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
             f"d={frames}:s=1080x1920:fps={fps},"
-            f"vignette=PI/4"
+            f"eq=contrast=1.06:brightness=0.02:saturation=1.12"
         )
         subprocess.run(
             [
@@ -376,9 +478,7 @@ def render_language_video(
                 "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "medium",
                 str(clip_path),
             ],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         scene_clips.append(clip_path)
 
@@ -392,19 +492,16 @@ def render_language_video(
             "ffmpeg", "-y", "-f", "concat", "-safe", "0",
             "-i", str(video_concat), "-c", "copy", str(raw_video),
         ],
-        check=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
 
-    # Generate subtle dark-ambient drone pad + burn subtitles + mix audio
     total_dur = sum(scene_durations)
     ass_escaped = ass_path.as_posix().replace(":", "\\:")
     filter_complex = (
         f"[0:v]ass='{ass_escaped}'[v];"
-        f"aevalsrc=0.025*sin(2*PI*55*t)+0.015*sin(2*PI*82.4*t)+0.01*sin(2*PI*110*t):"
+        f"aevalsrc=0.022*sin(2*PI*55*t)+0.014*sin(2*PI*82.4*t)+0.009*sin(2*PI*110*t):"
         f"s=44100:d={total_dur:.3f}[drone];"
-        f"[drone]lowpass=f=240,afade=t=in:st=0:d=1.5,afade=t=out:st={max(0, total_dur-1.5):.2f}:d=1.5[bg];"
+        f"[drone]lowpass=f=220,afade=t=in:st=0:d=1.2,afade=t=out:st={max(0, total_dur-1.2):.2f}:d=1.2[bg];"
         f"[1:a]loudnorm=I=-16:TP=-1.5:LRA=11[vo];"
         f"[vo][bg]amix=inputs=2:duration=first:dropout_transition=2[a]"
     )
@@ -419,9 +516,7 @@ def render_language_video(
             "-c:a", "aac", "-b:a", "192k", "-shortest",
             str(final_mp4),
         ],
-        check=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
 
 
@@ -434,6 +529,13 @@ def main() -> None:
 
     cfg = load_config()
     history = load_history()
+    gemini_client = genai.Client(api_key=gemini_key)
+
+    tts_models = _discover_models(gemini_key, "tts")
+    for preferred in ["gemini-2.5-flash-preview-tts", "gemini-3.1-flash-tts-preview", "gemini-3.8-flash-tts"]:
+        if preferred not in tts_models:
+            tts_models.append(preferred)
+    print(f"Discovered Gemini TTS candidates: {tts_models}")
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     scenes_dir = OUT_DIR / "scenes"
@@ -452,7 +554,7 @@ def main() -> None:
     )
     print(f"    Topic: {script['title_en']} / {script['title_tr']}")
 
-    print("2/4 Generating 9:16 visual frames with Cloudflare FLUX...")
+    print("2/4 Generating 9:16 visual frames (Cloudflare FLUX / Gemini Image)...")
     scene_images: list[Path] = []
     for scene in script["scenes"]:
         idx = int(scene["index"])
@@ -460,13 +562,14 @@ def main() -> None:
         generate_scene_image(
             account_id=cf_account,
             cf_token=cf_token,
-            model=cfg["visuals"]["cf_model"],
+            cf_models=cfg["visuals"]["cf_models"],
+            gemini_client=gemini_client,
             prompt=scene["image_prompt"],
             style_prompt=cfg["visuals"]["style_prompt"],
             out_path=img_path,
         )
         scene_images.append(img_path)
-        print(f"    Frame {idx}/{len(script['scenes'])} ready")
+        print(f"    Frame {idx}/{len(script['scenes'])} ready ({img_path.stat().st_size} bytes)")
 
     print("3/4 Rendering EN + TR vertical videos with FFmpeg...")
     work_dir = OUT_DIR / "work"
@@ -477,6 +580,8 @@ def main() -> None:
             lang_cfg=lang_cfg,
             scenes=script["scenes"],
             scene_images=scene_images,
+            gemini_client=gemini_client,
+            tts_models=tts_models,
             work_dir=work_dir,
             final_mp4=out_mp4,
             fps=cfg["production"]["fps"],

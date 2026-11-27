@@ -9,12 +9,16 @@ production:
   fps: 30
   languages:
     - code: "en"
-      voice: "en-US-AndrewNeural"
+      gemini_voice: "Charon"
+      edge_voice: "en-US-AndrewNeural"
       rate: "+4%"
     - code: "tr"
-      voice: "tr-TR-AhmetNeural"
-      rate: "+5%"
+      gemini_voice: "Charon"
+      edge_voice: "tr-TR-AhmetNeural"
+      rate: "+4%"
 
 visuals:
-  style_prompt: "dark moody chiaroscuro digital oil painting, dramatic rim lighting, deep shadows, obsidian and muted gold palette, mysterious psychological atmosphere, vertical 9:16 composition, no text, no watermark"
-  cf_model: "@cf/black-forest-labs/flux-1-schnell"
+  style_prompt: "vivid dramatic chiaroscuro digital oil painting, glowing rim lighting, rich contrast, obsidian and warm gold accents, mysterious psychological atmosphere, vertical 9:16 composition, highly detailed, no text, no watermark"
+  cf_models:
+    - "@cf/black-forest-labs/flux-1-schnell"
+    - "@cf/bytedance/stable-diffusion-xl-lightning"
