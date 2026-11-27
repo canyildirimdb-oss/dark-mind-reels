@@ -1,0 +1,63 @@
+name: "1 - Reels Üret (EN + TR)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      custom_topic:
+        description: "İsteğe bağlı özel konu (boş bırakırsan AI kendi seçer)"
+        required: false
+        default: ""
+  schedule:
+    # Her gün Türkiye saati ile 12:00 (09:00 UTC)
+    - cron: "0 9 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  produce:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Depoyu indir
+        uses: actions/checkout@v4
+
+      - name: Python 3.12 kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: FFmpeg ve Türkçe/İngilizce fontları kur
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg fonts-dejavu-core
+
+      - name: Python paketlerini kur
+        run: pip install -r requirements.txt
+
+      - name: EN + TR Reels videolarını üret
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CUSTOM_TOPIC: ${{ github.event.inputs.custom_topic }}
+        run: python -m pipeline.generate
+
+      - name: Konu geçmişini kaydet
+        run: |
+          git config user.name "Dark Mind Bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add state/history.json
+          git diff --cached --quiet || git commit -m "chore: update used topics"
+          git push
+
+      - name: GitHub Release olarak yayınla (EN + TR MP4)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: reels-${{ github.run_number }}
+          name: "Dark Mind Reels #${{ github.run_number }} (EN + TR)"
+          body_path: output/metadata.json
+          files: |
+            output/dark_mind_EN.mp4
+            output/dark_mind_TR.mp4
+            output/metadata.json

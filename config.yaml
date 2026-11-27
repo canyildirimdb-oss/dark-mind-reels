@@ -1,0 +1,20 @@
+channel:
+  name: "Dark Mind Secrets"
+  niche: "Dark Psychology, Stoicism & Human Behavior"
+
+production:
+  scenes_count: 6
+  width: 1080
+  height: 1920
+  fps: 30
+  languages:
+    - code: "en"
+      voice: "en-US-AndrewNeural"
+      rate: "+4%"
+    - code: "tr"
+      voice: "tr-TR-AhmetNeural"
+      rate: "+5%"
+
+visuals:
+  style_prompt: "dark moody chiaroscuro digital oil painting, dramatic rim lighting, deep shadows, obsidian and muted gold palette, mysterious psychological atmosphere, vertical 9:16 composition, no text, no watermark"
+  cf_model: "@cf/black-forest-labs/flux-1-schnell"
