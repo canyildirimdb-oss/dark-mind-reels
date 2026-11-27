@@ -92,10 +92,6 @@ Return ONLY valid JSON matching this schema:
   ]
 }}"""
 
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"gemini-2.5-flash:generateContent?key={api_key}"
-    )
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
@@ -103,9 +99,52 @@ Return ONLY valid JSON matching this schema:
             "responseMimeType": "application/json",
         },
     }
-    resp = requests.post(url, json=payload, timeout=90)
-    resp.raise_for_status()
-    data = resp.json()
+    candidates = [
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-2.5-flash-lite",
+        "gemini-1.5-flash-latest",
+    ]
+    try:
+        models_resp = requests.get(
+            f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}",
+            timeout=30,
+        )
+        if models_resp.ok:
+            discovered = [
+                m["name"].removeprefix("models/")
+                for m in models_resp.json().get("models", [])
+                if "generateContent" in m.get("supportedGenerationMethods", [])
+                and "flash" in m.get("name", "").lower()
+                and "tts" not in m.get("name", "").lower()
+                and "image" not in m.get("name", "").lower()
+            ]
+            for d in discovered:
+                if d not in candidates:
+                    candidates.insert(0, d)
+    except Exception:
+        pass
+
+    data = None
+    last_err: Exception | None = None
+    for model_name in candidates:
+        url = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{model_name}:generateContent?key={api_key}"
+        )
+        try:
+            resp = requests.post(url, json=payload, timeout=90)
+            if resp.status_code in (404, 429, 503):
+                print(f"[info] Model {model_name} returned {resp.status_code}, trying next...", file=sys.stderr)
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+            print(f"    Using Gemini model: {model_name}")
+            break
+        except Exception as exc:
+            last_err = exc
+    if data is None:
+        raise RuntimeError(f"All Gemini models failed. Last error: {last_err}")
     raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
     raw_text = re.sub(r"^```json\s*|\s*```$", "", raw_text.strip(), flags=re.MULTILINE)
     script = json.loads(raw_text)
